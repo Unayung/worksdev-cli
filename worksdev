@@ -1,0 +1,1231 @@
+#!/usr/bin/env python3
+"""worksdev - read the LINE WORKS Developer Console (dev.worksmobile.com) from
+the shell, as your own logged-in user.
+
+The console is the only place OAuth apps, client secrets and scopes live: the
+official LINE WORKS API cannot register an app or read its credentials. The
+console pages are thin HTML shells that fetch JSON from /console/... with your
+browser session, so this replays that session cookie.
+
+Reads apps and bots; can also register new ones. Every write needs --yes, and
+--dry-run shows the exact request first. Zero dependencies (Python 3.8+ stdlib).
+
+  Unofficial. Not affiliated with LINE WORKS / NAVER WORKS / Works Mobile.
+  These console endpoints are undocumented and private - they can change
+  without warning. `create` registers real apps and bots in a real tenant.
+  Use on your own account only, at human rates, and check your organisation's
+  IT policy.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+
+BASE = "https://dev.worksmobile.com"
+REGION = os.environ.get("WORKSDEV_REGION", "jp")  # only shapes the Referer
+# ponytail: one tenant per machine is the normal case; --domain / env override
+# is there for the second one. Discoverable from any app's domainId if it moves.
+DOMAIN = os.environ.get("WORKSDEV_DOMAIN", "400714392")
+
+ADMIN_BASE = "https://admin.worksmobile.com"
+# the admin console addresses the SAME tenant by a different id than the dev
+# console does (E231494 vs 400714392) - neither is derivable from the other.
+ADMIN_TENANT = os.environ.get("WORKSDEV_ADMIN_TENANT", "E231494")
+
+CONFIG_DIR = os.path.expanduser("~/.config/worksdev")
+COOKIE_FILE = os.path.join(CONFIG_DIR, "cookie")
+# dev.* and talk.* are both *.worksmobile.com behind one SSO, so a cookie
+# pasted for lineworks may already work here - try it before nagging.
+FALLBACK_COOKIE = os.path.expanduser("~/.config/lineworks/cookie")
+# drop an image here (or set WORKSDEV_DEFAULT_PHOTO) and every bot created
+# without --photo gets it instead of the console's grey placeholder
+DEFAULT_AVATAR_FILE = os.path.join(CONFIG_DIR, "default-avatar.png")
+
+EX_OK, EX_ERR, EX_USAGE, EX_AUTH, EX_NET = 0, 1, 2, 3, 4
+
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+SECRET_FIELDS = ("clientSecret",)
+
+
+class Auth(Exception):
+    pass
+
+
+class ApiError(Exception):
+    """Non-auth HTTP failure. Carries the code so callers can tell apart the
+    expected ones (a duplicate app name 4xxs) from real breakage."""
+
+    def __init__(self, code, body=""):
+        self.code, self.body = code, body
+        super().__init__(f"HTTP {code}: {body[:200]}")
+
+
+# ---------------------------------------------------------------- envelope
+def ok(data):
+    return {"ok": True, "data": data}
+
+
+def err(msg, code=EX_ERR, **detail):
+    return {"ok": False, "error": {"message": msg, "code": code,
+                                   "detail": detail or None}}
+
+
+def emit(payload, as_json, human=None):
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif payload.get("ok"):
+        print(human if human is not None else
+              json.dumps(payload["data"], ensure_ascii=False, indent=2))
+    else:
+        print(payload["error"]["message"], file=sys.stderr)
+    return EX_OK if payload.get("ok") else payload["error"]["code"]
+
+
+# -------------------------------------------------------------------- auth
+def load_cookie():
+    """Cookie from env, else ~/.config/worksdev/cookie, else the lineworks
+    one. Never printed."""
+    env = os.environ.get("WORKSDEV_COOKIE")
+    if env:
+        return env.strip()
+    for path in (COOKIE_FILE, FALLBACK_COOKIE):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                c = f.read().strip()
+        except FileNotFoundError:
+            continue
+        if c:
+            return c
+    return None
+
+
+def check_cookie_perms():
+    """A session cookie is a credential; refuse a world-readable one."""
+    if os.environ.get("WORKSDEV_COOKIE"):
+        return None
+    try:
+        mode = os.stat(COOKIE_FILE).st_mode & 0o777
+    except FileNotFoundError:
+        return None
+    if mode & 0o077:
+        return (f"{COOKIE_FILE} is mode {mode:o}; others can read your "
+                f"session. fix with: chmod 600 {COOKIE_FILE}")
+    return None
+
+
+def looks_logged_out(final_url, ctype, expect_json=True):
+    """An expired session does not 401 - it 302s to the SSO login page, which
+    then returns 200 text/html. Treat that as auth failure, not as data. Some
+    console endpoints (bot/list) legitimately serve HTML, so the content-type
+    tell only counts where JSON was expected."""
+    if "auth.worksmobile.com" in final_url or "/login" in final_url:
+        return True
+    return expect_json and "html" in (ctype or "").lower()
+
+
+# --------------------------------------------------------------- transport
+def request(path, body=None, method=None, expect_json=True, debug=False,
+            base=None, headers=None, raw_bytes=False,
+            data_bytes=None, content_type=None):
+    cookie = load_cookie()
+    if not cookie:
+        raise Auth(f"no session cookie: put the Cookie header from a "
+                   f"logged-in dev console request in {COOKIE_FILE} "
+                   f"(chmod 600), or set WORKSDEV_COOKIE")
+    warn = check_cookie_perms()
+    if warn:
+        raise Auth(warn)
+    method = method or ("POST" if (body is not None or data_bytes) else "GET")
+    base = base or BASE
+    url = base + path
+    if debug:
+        print(f"{method} {url} {json.dumps(body, ensure_ascii=False) if body else ''}",
+              file=sys.stderr)
+    hdrs = {
+        "Cookie": cookie,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"{BASE}/{REGION}/console/openapi/v2/app/list/view",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+        "User-Agent": UA,
+    }
+    hdrs.update(headers or {})
+    data = None
+    if data_bytes is not None:
+        data, hdrs["Content-Type"] = data_bytes, content_type
+    elif body is not None:
+        data = json.dumps(body).encode()
+        hdrs["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            final, ctype = r.url, r.headers.get("Content-Type", "")
+            blob = r.read()
+            if raw_bytes:
+                return blob
+            text = blob.decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise Auth("session rejected - log in again and refresh the cookie")
+        raise ApiError(e.code, e.read().decode("utf-8", errors="replace"))
+    except urllib.error.URLError as e:
+        raise SystemExit(f"network error: {e}")
+    if looks_logged_out(final, ctype, expect_json):
+        raise Auth("session expired - log in again and refresh the cookie")
+    try:
+        out = json.loads(text)
+    except json.JSONDecodeError:
+        return {"_raw": text}
+    # the console's own ajax wrapper checks these two on every response
+    if isinstance(out, dict):
+        if out.get("code") == "logout":
+            raise Auth("session expired - log in again and refresh the cookie")
+        if out.get("isROS") == "Y":
+            raise SystemExit("console is in read-only service mode; writes "
+                             "will not stick - try again later")
+    return out
+
+
+def get(path, expect_json=True, debug=False):
+    return request(path, expect_json=expect_json, debug=debug)
+
+
+def fetch_apps(args):
+    q = urllib.parse.urlencode({"manageDomainId": args.domain,
+                                "count": args.count, "cursor": args.cursor})
+    resp = get(f"/console/openapi/v2/app/list?{q}", args.debug)
+    return ((resp.get("response") or {}).get("appList")) or []
+
+
+# ----------------------------------------------------------------- masking
+def mask(app, reveal):
+    """clientSecret ships in the LIST response in plaintext - one `app list`
+    would otherwise dump every app's secret into a scrollback or a log."""
+    if reveal:
+        return app
+    out = dict(app)
+    for f in SECRET_FIELDS:
+        if out.get(f):
+            out[f] = "•" * len(out[f])
+    return out
+
+
+# ---------------------------------------------------------------- commands
+def cmd_doctor(args):
+    apps = fetch_apps(args)
+    d = {"domainId": args.domain, "apps": len(apps),
+         "cookie": ("env" if os.environ.get("WORKSDEV_COOKIE")
+                    else COOKIE_FILE if os.path.exists(COOKIE_FILE)
+                    else FALLBACK_COOKIE)}
+    return emit(ok(d), args.json,
+                human=f"session ok · domain {args.domain} · {len(apps)} apps")
+
+
+def cells(s):
+    """Terminal columns, not codepoints - CJK app names render double-width."""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def cmd_app_list(args):
+    apps = [mask(a, args.reveal) for a in fetch_apps(args)]
+    if args.json:
+        return emit(ok(apps), True)
+    if not apps:
+        return emit(ok(apps), False, "(no apps)")
+    names = [a.get("appName") or "" for a in apps]
+    w = max(cells(n) for n in names)
+    lines = [f"  {n}{' ' * (w - cells(n))}  {a.get('clientAppType',''):6}  "
+             f"{a.get('clientId','')}  {a.get('modifyDate','')}"
+             for n, a in zip(names, apps)]
+    return emit(ok(apps), False, "\n".join(lines))
+
+
+def pick(apps, needle):
+    """Match on clientId / appId / exact name, then unique substring of name.
+    Never guess between two matches - the next command might be a write."""
+    n = needle.lower()
+    exact = [a for a in apps if needle in (a.get("clientId"), a.get("appId"))
+             or (a.get("appName") or "").lower() == n]
+    if len(exact) == 1:
+        return exact[0]
+    part = [a for a in apps if n in (a.get("appName") or "").lower()]
+    if len(part) == 1:
+        return part[0]
+    if not part:
+        raise SystemExit(f"no app matches {needle!r}")
+    names = ", ".join(repr(a.get("appName")) for a in part)
+    raise SystemExit(f"{needle!r} matches {len(part)} apps: {names}")
+
+
+def cmd_app_show(args):
+    app = mask(pick(fetch_apps(args), args.app), args.reveal)
+    if args.json:
+        return emit(ok(app), True)
+    skip = {"publicKey"} if not args.reveal else set()
+    lines = [f"  {k}: {v}" for k, v in app.items() if k not in skip]
+    return emit(ok(app), False, "\n".join(lines))
+
+
+# ------------------------------------------------------------ app create
+# the console offers three create endpoints, one per app kind
+APP_TYPES = {"normal": "/console/openapi/v2/app",
+             "scim": "/console/openapi/v2/scim-app",
+             "delegated": "/console/openapi/v2/auth-delegated-app"}
+
+
+def app_name_free(name, args):
+    """The console validates the name before enabling its create button; a
+    taken name comes back as an HTTP error, not a false flag."""
+    try:
+        request(f"/console/openapi/v2/app/appname/validate?manageDomainId={args.domain}",
+                body={"appName": name}, debug=args.debug)
+        return True
+    except ApiError:
+        return False
+
+
+def cmd_app_create(args):
+    if not app_name_free(args.name, args):
+        return emit(err(f"app name {args.name!r} is already taken"), args.json)
+    path = f"{APP_TYPES[args.type]}?manageDomainId={args.domain}"
+    plan = {"endpoint": path, "body": {"appName": args.name}, "type": args.type}
+    if args.dry_run:
+        return emit(ok(dict(plan, dry_run=True)), args.json,
+                    human=f"[dry-run] name is free · would POST {path}\n"
+                          f"          {json.dumps(plan['body'], ensure_ascii=False)}")
+    if not args.yes:
+        return emit(err("refusing to create without --yes", EX_USAGE), args.json)
+    res = request(path, body={"appName": args.name}, debug=args.debug)
+    app_id = res if isinstance(res, str) else (res or {}).get("_raw", res)
+    # the console redirects to the edit page; we just read the app back
+    app = next((a for a in fetch_apps(args) if a.get("appId") == app_id
+                or a.get("appName") == args.name), None)
+    out = {"appId": app_id, "app": mask(app, args.reveal) if app else None}
+    return emit(ok(out), args.json,
+                human=f"created {args.name!r} ({args.type})\n"
+                      f"  appId: {app_id}\n"
+                      f"  clientId: {(app or {}).get('clientId', '?')}\n"
+                      f"  secret: worksdev app show {args.name!r} --reveal")
+
+
+# ------------------------------------------------------------ bot commands
+BOT_LANGS = ("default", "en", "ja", "ko", "zh-CN", "zh-TW")
+CHANNEL_EVENTS = ("message", "postback", "join", "leave",
+                  "joined", "left", "begin", "end")
+MESSAGE_TYPES = ("text", "location", "sticker", "image", "file", "audio", "video")
+# the bot API rejects an empty photoUrl map with a generic code 21; the console
+# always sends this placeholder, so send it too unless a real one is given
+DEFAULT_BOT_PHOTO = "https://ssl.pstatic.net/static/wm/botimage/noimage_bot.png"
+
+_BOT_RE = re.compile(
+    r'data-bot_no="(?P<no>\d+)".*?'
+    r'class="bot_name _botName">(?P<name>[^<]*)', re.S)
+
+
+def parse_bots(html):
+    """/console/bot/list serves an HTML fragment, not JSON - the bot console
+    predates the openapi one. Pull the id and name off each row."""
+    return [{"botNo": m.group("no"), "name": m.group("name").strip()}
+            for m in _BOT_RE.finditer(html)]
+
+
+def cmd_bot_list(args):
+    page = get("/console/bot/list", expect_json=False, debug=args.debug)
+    bots = parse_bots(page.get("_raw", ""))
+    if args.json:
+        return emit(ok(bots), True)
+    if not bots:
+        return emit(ok(bots), False, "(no bots)")
+    w = max(cells(b["name"]) for b in bots)
+    return emit(ok(bots), False, "\n".join(
+        f"  {b['name']}{' ' * (w - cells(b['name']))}  {b['botNo']}" for b in bots))
+
+
+def current_user_no(args):
+    """Bot managers are user numbers. The logged-in user's own number is in the
+    gnb header's profile-photo URL - the console never states it outright."""
+    page = get("/console/gnb/get", expect_json=False, debug=args.debug)
+    m = re.search(r"DOMAIN_USER&(?:amp;)?id=(\d+)", page.get("_raw", ""))
+    if not m:
+        raise SystemExit("could not resolve your user number; pass --manager <userNo>")
+    return int(m.group(1))
+
+
+def csv_opt(value, allowed, label):
+    if not value:
+        return []
+    picked = [v.strip() for v in value.split(",") if v.strip()]
+    bad = [v for v in picked if v not in allowed]
+    if bad:
+        raise SystemExit(f"unknown {label}: {', '.join(bad)} "
+                         f"(pick from {', '.join(allowed)})")
+    return picked
+
+
+def cmd_bot_create(args):
+    manager = args.manager or current_user_no(args)
+    events = csv_opt(args.events, CHANNEL_EVENTS, "event")
+    msg_types = csv_opt(args.message_types, MESSAGE_TYPES, "message type")
+    if args.callback_url and not events:
+        events = ["message"]
+    if "message" in events and not msg_types:
+        msg_types = ["text"]
+    body = {
+        "botNo": "",
+        "name": {"default": args.name},
+        "description": {"default": args.description},
+        "photoUrl": {"default": resolve_photo(args.photo, args, dry=args.dry_run)},
+        "joinTypeList": ["group"] if args.group else [],
+        "usePersistantMenu": False,
+        "callbackUrl": args.callback_url or "",
+        "callbackEventList": msg_types if args.callback_url else [],
+        "channelEventList": events if args.callback_url else [],
+        "managerList": [int(manager)],
+        "submanagerList": [],
+        "interfaceType": 1,       # console hardcodes 1 (bot API 2.0)
+        "allowDomainIdList": [0],  # [0] = all domains; required, omitting it 21s
+    }
+    if args.dry_run:
+        return emit(ok({"endpoint": "/console/bot/register", "body": body,
+                        "dry_run": True}), args.json,
+                    human="[dry-run] would POST /console/bot/register\n" +
+                          json.dumps(body, ensure_ascii=False, indent=2))
+    if not args.yes:
+        return emit(err("refusing to create without --yes", EX_USAGE), args.json)
+    res = request("/console/bot/register", body=body, debug=args.debug)
+    code = (res or {}).get("code")
+    if code == "11":
+        return emit(err("bot limit for this tenant reached"), args.json)
+    if code != "00":
+        return emit(err(f"bot create failed (code {code})", detail=res), args.json)
+    new = [b for b in parse_bots(get("/console/bot/list", expect_json=False,
+                                     debug=args.debug).get("_raw", ""))
+           if b["name"] == args.name]
+    return emit(ok({"created": args.name, "bots": new}), args.json,
+                human=f"created bot {args.name!r}" +
+                      (f" (botNo {new[0]['botNo']})" if new else ""))
+
+
+# --------------------------------------------- app scopes / key / account
+# the 42 scopes the console's picker offers; bot + bot.read are what a bot needs
+SCOPES = (
+    "openid", "profile", "email", "audit.read", "board", "board.read", "bot",
+    "bot.message", "bot.read", "calendar", "calendar.read", "contact",
+    "contact.read", "cxtalk", "cxtalk.read", "directory", "directory.read",
+    "file", "file.read", "form", "form.read", "group", "group.folder",
+    "group.folder.read", "group.note", "group.note.read", "group.read", "mail",
+    "mail.read", "monitoring.read", "orgunit", "orgunit.read",
+    "security.external-browser", "security.external-browser.read", "task",
+    "task.read", "user", "user.email.read", "user.profile.read", "user.read",
+    "workflow", "workflow.read")
+
+
+def cmd_app_grant(args):
+    app = pick(fetch_apps(args), args.app)
+    scopes = csv_opt(args.scopes, SCOPES, "scope")
+    if not scopes:
+        return emit(err("--scopes is required", EX_USAGE), args.json)
+    path = (f"/console/openapi/v2/app/{app['appId']}/api-scope"
+            f"?manageDomainId={args.domain}")
+    if args.dry_run:
+        return emit(ok({"endpoint": path, "apiScopeList": scopes, "dry_run": True}),
+                    args.json, human=f"[dry-run] would PUT {path}\n"
+                                     f"          {', '.join(scopes)}")
+    if not args.yes:
+        return emit(err("refusing to change scopes without --yes", EX_USAGE), args.json)
+    request(path, body={"apiScopeList": scopes}, method="PUT", debug=args.debug)
+    return emit(ok({"app": app["appName"], "scopes": scopes}), args.json,
+                human=f"granted to {app['appName']!r}: {', '.join(scopes)}")
+
+
+def cmd_app_service_account(args):
+    app = pick(fetch_apps(args), args.app)
+    if app.get("accountEmail") and not args.remove:
+        return emit(ok({"accountEmail": app["accountEmail"], "existing": True}),
+                    args.json, human=f"already has one: {app['accountEmail']}")
+    path = (f"/console/openapi/v2/app/{app['appId']}/service-account"
+            f"?manageDomainId={args.domain}")
+    verb = "DELETE" if args.remove else "PUT"
+    if args.dry_run:
+        return emit(ok({"endpoint": path, "method": verb, "dry_run": True}),
+                    args.json, human=f"[dry-run] would {verb} {path}")
+    if not args.yes:
+        return emit(err(f"refusing to {verb.lower()} without --yes", EX_USAGE), args.json)
+    res = request(path, method=verb, body=None if verb == "DELETE" else {},
+                  debug=args.debug)
+    email = (res or {}).get("accountEmail") if isinstance(res, dict) else None
+    return emit(ok(res), args.json,
+                human=f"removed" if args.remove else f"created {email}")
+
+
+def cmd_app_rsakey(args):
+    """Every call to this endpoint MINTS A NEW KEY PAIR and invalidates the old
+    one - the console says '有效的密鑰僅限1個'. Verified: two calls return two
+    different keys, and the app's publicKey follows the latest. So an app that
+    already has a key is refused unless --rotate is passed explicitly."""
+    app = pick(fetch_apps(args), args.app)
+    has_key = bool(app.get("publicKey"))
+    if has_key and not args.rotate:
+        return emit(err(f"{app['appName']!r} already has a key; downloading mints "
+                        f"a NEW one and breaks whatever uses the current key. "
+                        f"Pass --rotate if that is what you want.", EX_USAGE),
+                    args.json)
+    path = (f"/console/openapi/v2/app/{app['appId']}/rsakey/download"
+            f"?manageDomainId={args.domain}")
+    out = args.out or f"{app['appName'].replace(' ', '_')}.pem"
+    if args.dry_run:
+        return emit(ok({"endpoint": path, "out": out, "rotates": has_key,
+                        "dry_run": True}), args.json,
+                    human=f"[dry-run] would GET {path}\n"
+                          f"          -> {out}" +
+                          ("\n          THIS ROTATES THE EXISTING KEY" if has_key else ""))
+    if not args.yes:
+        return emit(err("refusing to mint a key without --yes", EX_USAGE), args.json)
+    pem = request(path, debug=args.debug, raw_bytes=True)
+    if b"PRIVATE KEY" not in pem:
+        return emit(err("response was not a PEM", detail=pem[:120].decode(
+            "utf-8", "replace")), args.json)
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(pem)
+    return emit(ok({"out": out, "bytes": len(pem), "rotated": has_key}), args.json,
+                human=f"wrote {out} ({len(pem)} bytes, mode 600)")
+
+
+# secrets are base64-ish and DO contain '+' - anchor on the closing tag rather
+# than guessing the alphabet, or the value silently truncates at the first '+'
+_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+         ".gif": "image/gif", ".webp": "image/webp"}
+
+
+def upload_photo(path, args):
+    """POST the file as multipart to the console's uploader, which answers
+    {photoUrl}. Written by hand because the stdlib has no multipart encoder."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in _MIME:
+        raise SystemExit(f"unsupported image type {ext or '(none)'} "
+                         f"(want {', '.join(sorted(_MIME))})")
+    with open(path, "rb") as f:
+        blob = f.read()
+    boundary = "----worksdev" + os.urandom(8).hex()
+    body = b"".join([
+        f"--{boundary}\r\n".encode(),
+        b'Content-Disposition: form-data; name="imageFile"; filename="'
+        + os.path.basename(path).encode() + b'"\r\n',
+        f"Content-Type: {_MIME[ext]}\r\n\r\n".encode(),
+        blob, b"\r\n", f"--{boundary}--\r\n".encode()])
+    res = request("/console/bot/img/upload", data_bytes=body,
+                  content_type=f"multipart/form-data; boundary={boundary}",
+                  debug=args.debug,
+                  headers={"Referer": f"{BASE}/console/bot/form"})
+    url = (res or {}).get("photoUrl")
+    if not url:
+        raise SystemExit(f"upload rejected: {(res or {}).get('message') or res}")
+    return url
+
+
+def resolve_photo(value, args, dry=False):
+    """--photo takes either an https URL (used as-is; the console accepts
+    external hosts - one live bot points at cdn.phototourl.com) or a local
+    file, which gets uploaded first. With neither, fall back to your own
+    default avatar if you have one, else the console placeholder."""
+    if not value:
+        value = os.environ.get("WORKSDEV_DEFAULT_PHOTO")
+        if not value and os.path.isfile(DEFAULT_AVATAR_FILE):
+            value = DEFAULT_AVATAR_FILE
+    if not value:
+        return DEFAULT_BOT_PHOTO
+    if value.startswith(("http://", "https://")):
+        return value
+    if not os.path.isfile(value):
+        raise SystemExit(f"--photo: no such file {value!r} "
+                         f"(and it is not an http(s) URL)")
+    # a dry run must not upload - that would store a real asset server-side
+    return f"<would upload {value}>" if dry else upload_photo(value, args)
+
+
+_SECRET_RE = re.compile(r'id="botSecret"[^>]*>([^<]+)<')
+
+
+def cmd_bot_show(args):
+    page = get(f"/console/bot/info/{args.bot}", expect_json=False, debug=args.debug)
+    html = page.get("_raw", "")
+    m = _SECRET_RE.search(html)
+    # the info page labels its fields in the tenant's language; the list page
+    # markup is stable, so take the name from there instead
+    name = next((b["name"] for b in parse_bots(
+        get("/console/bot/list", expect_json=False, debug=args.debug).get("_raw", ""))
+        if str(b["botNo"]) == str(args.bot)), None)
+    out = {"botNo": args.bot, "name": name,
+           "botSecret": m.group(1).strip() if m else None}
+    if not args.reveal and out["botSecret"]:
+        out["botSecret"] = "•" * len(out["botSecret"])
+    return emit(ok(out), args.json,
+                human="\n".join(f"  {k}: {v}" for k, v in out.items()))
+
+
+# ------------------------------------------------------------ admin plane
+def admin(path, body=None, method="POST", debug=False):
+    """admin.worksmobile.com is a separate host with its own tenant id in the
+    path, and it wants the version header on every bot call."""
+    return request(f"/api/{ADMIN_TENANT}{path}", body=body, method=method,
+                   debug=debug, base=ADMIN_BASE,
+                   headers={"X-WORKS-ADMIN-VERSION": "2",
+                            "Origin": ADMIN_BASE,
+                            "Referer": f"{ADMIN_BASE}/service/bot"})
+
+
+def admin_bots(registered, args, page=1):
+    res = admin("/botapi/internal/admin/getBotList",
+                {"register": registered, "language": "zh-TW",
+                 "pageIndex": page, "pagePerLength": 100}, debug=args.debug)
+    return (res or {}).get("botList") or []
+
+
+def cmd_admin_pending(args):
+    bots = admin_bots(False, args)
+    if args.json:
+        return emit(ok(bots), True)
+    if not bots:
+        return emit(ok(bots), False, "(nothing pending - every bot is enabled)")
+    return emit(ok(bots), False, "\n".join(
+        f"  {(b.get('name') or {}).get('default','?')}  {b.get('botNo')}" for b in bots))
+
+
+def cmd_admin_list(args):
+    bots = admin_bots(True, args)
+    if args.json:
+        return emit(ok(bots), True)
+    return emit(ok(bots), False, "\n".join(
+        f"  {(b.get('name') or {}).get('default','?')}  {b.get('botNo')}  "
+        f"status={b.get('status')}" for b in bots) or "(no bots)")
+
+
+def enable_bot(bot_no, args):
+    """registerBot only ADDS the bot to the tenant, at status 1 (off) - the
+    console's own toggle then flips it to 2. Verified on a fresh bot: after
+    registerBot it listed as status=1 alongside six status=2 bots. So a real
+    'enable' is both calls. allowUserNoList [0] is the console's 'everyone'."""
+    admin("/botapi/internal/admin/registerBot", {"botNo": int(bot_no)},
+          debug=args.debug)
+    if not getattr(args, "register_only", False):
+        admin("/botapi/internal/admin/updateBotStatus",
+              {"botNo": int(bot_no), "status": 2,
+               "allowUserNoList": [int(u) for u in (
+                   getattr(args, "allow", None) or "0").split(",") if u.strip()]},
+              debug=args.debug)
+    return next((b for b in admin_bots(True, args)
+                 if str(b.get("botNo")) == str(bot_no)), None)
+
+
+def cmd_admin_enable(args):
+    if args.dry_run:
+        steps = ["registerBot {botNo}"] + ([] if args.register_only else
+                                           ["updateBotStatus status=2"])
+        return emit(ok({"botNo": args.bot, "steps": steps, "dry_run": True}),
+                    args.json, human=f"[dry-run] bot {args.bot}: " + " then ".join(steps))
+    if not args.yes:
+        return emit(err("refusing to enable without --yes", EX_USAGE), args.json)
+    b = enable_bot(args.bot, args)
+    if not b:
+        return emit(err(f"bot {args.bot} is not in the enabled list afterwards"),
+                    args.json)
+    return emit(ok({"botNo": args.bot, "status": b.get("status")}), args.json,
+                human=f"enabled bot {args.bot} (status={b.get('status')})")
+
+
+def cmd_admin_status(args):
+    body = {"botNo": int(args.bot), "status": args.status,
+            "allowUserNoList": [int(u) for u in (args.allow or "").split(",") if u.strip()]}
+    if args.dry_run:
+        return emit(ok({"body": body, "dry_run": True}), args.json,
+                    human=f"[dry-run] would POST updateBotStatus {body}")
+    if not args.yes:
+        return emit(err("refusing to change status without --yes", EX_USAGE), args.json)
+    admin("/botapi/internal/admin/updateBotStatus", body, debug=args.debug)
+    return emit(ok(body), args.json, human=f"bot {args.bot} status={args.status}")
+
+
+# --------------------------------------------------------------- onboard
+def cmd_onboard(args):
+    """app -> scopes -> service account -> key -> bot -> enable, then print the
+    openclaw account block. Each step prints as it lands, and a failure reports
+    what already exists so you can finish by hand instead of re-running blind."""
+    done = []
+
+    def step(msg):
+        print(f"  {msg}", file=sys.stderr)
+        done.append(msg)
+
+    scopes = csv_opt(args.scopes, SCOPES, "scope") or ["bot", "bot.read"]
+    # the app and the bot are separate objects and usually want separate
+    # names (this tenant pairs 'Racco-Nike App' with a bot called 學妹)
+    bot_name = args.bot_name or args.name
+    key_out = args.key_out or f"{args.name.replace(' ', '_')}.pem"
+    if args.dry_run:
+        plan = ["validate + create app", f"grant scopes: {', '.join(scopes)}",
+                "create service account", f"mint RSA key -> {key_out}",
+                f"create bot {bot_name!r}", "enable bot in admin"]
+        return emit(ok({"plan": plan, "dry_run": True}), args.json,
+                    human="[dry-run] would:\n" + "\n".join(f"  {i+1}. {s}"
+                                                           for i, s in enumerate(plan)))
+    if not args.yes:
+        return emit(err("refusing to provision without --yes", EX_USAGE), args.json)
+    try:
+        if not app_name_free(args.name, args):
+            return emit(err(f"app name {args.name!r} is already taken"), args.json)
+        res = request(f"/console/openapi/v2/app?manageDomainId={args.domain}",
+                      body={"appName": args.name}, debug=args.debug)
+        app_id = res if isinstance(res, str) else (res or {}).get("_raw")
+        step(f"app created: {app_id}")
+
+        request(f"/console/openapi/v2/app/{app_id}/api-scope?manageDomainId={args.domain}",
+                body={"apiScopeList": scopes}, method="PUT", debug=args.debug)
+        step(f"scopes granted: {', '.join(scopes)}")
+
+        sa = request(f"/console/openapi/v2/app/{app_id}/service-account"
+                     f"?manageDomainId={args.domain}", body={}, method="PUT",
+                     debug=args.debug)
+        step(f"service account: {(sa or {}).get('accountEmail')}")
+
+        pem = request(f"/console/openapi/v2/app/{app_id}/rsakey/download"
+                      f"?manageDomainId={args.domain}", debug=args.debug,
+                      raw_bytes=True)
+        fd = os.open(key_out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(pem)
+        step(f"private key: {key_out} ({len(pem)} bytes)")
+
+        photo = resolve_photo(args.photo, args)
+        if args.photo:
+            step(f"avatar: {photo}")
+
+        bot_body = {
+            "botNo": "", "name": {"default": bot_name},
+            "description": {"default": args.description},
+            "photoUrl": {"default": photo},
+            "joinTypeList": ["group"] if args.group else [],
+            "usePersistantMenu": False, "callbackUrl": args.callback_url or "",
+            "callbackEventList": ["text", "image"] if args.callback_url else [],
+            "channelEventList": ["message"] if args.callback_url else [],
+            "managerList": [int(args.manager or current_user_no(args))],
+            "submanagerList": [], "interfaceType": 1, "allowDomainIdList": [0],
+        }
+        br = request("/console/bot/register", body=bot_body, debug=args.debug)
+        if (br or {}).get("code") != "00":
+            raise SystemExit(f"bot create failed (code {(br or {}).get('code')})")
+        bots = [b for b in parse_bots(get("/console/bot/list", expect_json=False,
+                                          debug=args.debug).get("_raw", ""))
+                if b["name"] == bot_name]
+        if not bots:
+            raise SystemExit("bot created but could not find its botNo")
+        bot_no = bots[0]["botNo"]
+        step(f"bot created: {bot_no}")
+
+        html = get(f"/console/bot/info/{bot_no}", expect_json=False,
+                   debug=args.debug).get("_raw", "")
+        m = _SECRET_RE.search(html)
+        bot_secret = m.group(1).strip() if m else None
+        step("bot secret read" if bot_secret else "bot secret NOT found")
+
+        b = enable_bot(bot_no, args)
+        enabled = bool(b) and b.get("status") == 2
+        step(f"enabled in admin (status={b.get('status') if b else '?'})")
+    except (SystemExit, ApiError, Auth) as e:
+        print(f"\nFAILED: {e}\ncompleted so far:", file=sys.stderr)
+        for d in done:
+            print(f"  - {d}", file=sys.stderr)
+        return EX_ERR
+
+    app = pick(fetch_apps(args), app_id)
+    account = {
+        "name": bot_name, "botId": bot_no, "botSecret": bot_secret,
+        "webhookPath": f"/lineworks/{args.account or args.name.lower()}/webhook",
+    }
+    channel = {
+        "clientId": app.get("clientId"), "clientSecret": app.get("clientSecret"),
+        "serviceAccount": app.get("accountEmail"),
+        "privateKeyFile": os.path.abspath(key_out), "domainId": args.domain,
+    }
+    out = {"appId": app_id, "botNo": bot_no, "enabled": enabled,
+           "channel": channel, "account": account}
+    if args.json:
+        return emit(ok(out), True)
+    return emit(ok(out), False,
+                "\nopenclaw config — channels.lineworks:\n" +
+                json.dumps(channel, ensure_ascii=False, indent=2) +
+                f"\n\nchannels.lineworks.accounts.{args.account or args.name.lower()}:\n" +
+                json.dumps(account, ensure_ascii=False, indent=2))
+
+
+# ---------------------------------------------------- app read-modify-write
+def _list_items(html, list_id):
+    """<ul id="..."><li><span>value</span></li>…</ul> - the console reads its
+    own rendered list back out the same way."""
+    m = re.search(r'id="%s"[^>]*>(.*?)</ul>' % list_id, html, re.S)
+    return [] if not m else [t.strip() for t in
+                             re.findall(r"<span[^>]*>([^<]*)</span>", m.group(1))
+                             if t.strip()]
+
+
+def read_app(app, args):
+    """Rebuild the whole PATCH payload. A partial PATCH is rejected outright
+    (400 INVALID_PARAMETER), so every field has to be supplied - and the edit
+    form is the only place several of them exist."""
+    html = get(f"/console/openapi/v2/app/edit/view/{app['appId']}"
+               f"?manageDomainId={args.domain}", expect_json=False,
+               debug=args.debug).get("_raw", "")
+    if "app_name_input" not in html:
+        raise SystemExit(f"could not load the edit form for {app['appName']!r}")
+    users = get(f"/console/openapi/v2/app/{app['appId']}/app-users"
+                f"?manageDomainId={args.domain}", debug=args.debug) or {}
+    desc = re.search(r'id="app_desc_input"[^>]*>([^<]*)</textarea>', html)
+    tenant = re.search(r'<input[^>]*id="radio_access_type_tenant"[^>]*>', html)
+    sel = re.search(r'<input[^>]*id="selected_user_access_button"[^>]*>', html)
+    return {
+        "appName": app.get("appName"),
+        "appDescription": desc.group(1).strip() if desc else "",
+        "redirectUrlList": _list_items(html, "url_list"),
+        # note the shape: this endpoint wants objects, while the dedicated
+        # PUT .../api-scope endpoint wants bare strings for the same thing
+        "apiScopeList": [{"scope": s} for s in _list_items(html, "scope_list")],
+        "accessType": ("TENANT" if tenant and "checked" in tenant.group(0)
+                       else "DOMAIN"),
+        "logoutRedirectUrlList": _list_items(html, "logout_url_list"),
+        "accessTokenTtl": app.get("accessTokenTtl"),
+        "refreshTokenRotationYn": app.get("refreshTokenRotationYn"),
+        "userAccessType": ("SELECTED" if sel and "checked" in sel.group(0)
+                           else users.get("userAccessType") or "ALL"),
+        "accessUserIdNoList": [str(u.get("userIdNo") or u.get("id"))
+                               for u in (users.get("userInfoList") or [])],
+    }
+
+
+def cmd_app_set(args):
+    app = pick(fetch_apps(args), args.app)
+    before = read_app(app, args)
+    after = json.loads(json.dumps(before))
+    if args.name:
+        after["appName"] = args.name
+    if args.description is not None:
+        after["appDescription"] = args.description
+    if args.scopes is not None:
+        after["apiScopeList"] = [{"scope": s} for s in
+                                 csv_opt(args.scopes, SCOPES, "scope")]
+    if args.redirect_urls is not None:
+        after["redirectUrlList"] = [u.strip() for u in
+                                    args.redirect_urls.split(",") if u.strip()]
+    if args.ttl:
+        after["accessTokenTtl"] = args.ttl
+    if args.rotation:
+        after["refreshTokenRotationYn"] = args.rotation
+
+    changed = {k: (before[k], after[k]) for k in after if before[k] != after[k]}
+    if not changed:
+        return emit(ok({"app": app["appName"], "changed": {}}), args.json,
+                    human="nothing to change")
+    diff = "\n".join(
+        f"  {k}:\n    - {json.dumps(o, ensure_ascii=False)}\n"
+        f"    + {json.dumps(n, ensure_ascii=False)}" for k, (o, n) in changed.items())
+    if args.dry_run:
+        return emit(ok({"changed": changed, "payload": after, "dry_run": True}),
+                    args.json, human=f"[dry-run] {app['appName']!r}\n{diff}")
+    if not args.yes:
+        return emit(err("refusing to modify without --yes", EX_USAGE), args.json)
+    kind = {"SCIM": "scim-app", "AUTH_DELEGATION": "auth-delegated-app"}.get(
+        app.get("clientAppType"), "app")
+    request(f"/console/openapi/v2/{kind}/{app['appId']}?manageDomainId={args.domain}",
+            body=after, method="PATCH", debug=args.debug)
+    return emit(ok({"app": app["appName"], "changed": list(changed)}), args.json,
+                human=f"updated {app['appName']!r}\n{diff}")
+
+
+def cmd_app_delete(args):
+    app = pick(fetch_apps(args), args.app)
+    kind = {"SCIM": "scim-app", "AUTH_DELEGATION": "auth-delegated-app"}.get(
+        app.get("clientAppType"), "app")
+    path = f"/console/openapi/v2/{kind}/{app['appId']}?manageDomainId={args.domain}"
+    if args.dry_run:
+        return emit(ok({"endpoint": path, "method": "DELETE", "dry_run": True}),
+                    args.json, human=f"[dry-run] would DELETE {app['appName']!r}\n"
+                                     f"          {path}")
+    if not args.yes:
+        return emit(err("refusing to delete without --yes", EX_USAGE), args.json)
+    request(path, method="DELETE", debug=args.debug)
+    gone = not any(a.get("appId") == app["appId"] for a in fetch_apps(args))
+    return emit(ok({"deleted": app["appName"], "gone": gone}), args.json,
+                human=f"deleted {app['appName']!r}" if gone else
+                      f"DELETE returned ok but {app['appName']!r} is still listed")
+
+
+# ---------------------------------------------------- bot read-modify-write
+def _i18n_langs_on(html, field):
+    """Only rows carrying class 'on' go into an i18n map - that is what the
+    console's own _getI18nValues does."""
+    return {m.group(1) for m in re.finditer(
+        r'class="_%sTr[^"]*\bon\b"[^>]*data-lang="([^"]*)"' % field, html)}
+
+
+def _i18n_inputs(html, cls, textarea=False):
+    if textarea:
+        pat = r'%s[^>]*data-lang="([^"]*)"[^>]*>([^<]*)</textarea>' % cls
+    else:
+        pat = r'%s[^>]*data-lang="([^"]*)"[^>]*value="([^"]*)"' % cls
+    return dict(re.findall(pat, html))
+
+
+def _checked(html, ident):
+    m = re.search(r'<input[^>]*id="%s"[^>]*>' % re.escape(ident), html)
+    return bool(m and "checked" in m.group(0))
+
+
+def read_bot(bot_no, args):
+    """Reconstruct the FULL bot object the console would submit. The modify
+    form is authoritative for the i18n maps, callback settings and events;
+    managers are not in the markup (JS fills them in later), so those come
+    from the admin console's getBotInfo. If managers cannot be read we refuse
+    to write, because sending an empty managerList would orphan the bot."""
+    html = get(f"/console/bot/modify/view/{bot_no}", expect_json=False,
+               debug=args.debug).get("_raw", "")
+    if "_botName" not in html:
+        raise SystemExit(f"could not load the modify form for bot {bot_no} "
+                         f"(deleted, or not yours)")
+    names = _i18n_inputs(html, "_botName")
+    descs = _i18n_inputs(html, "_botDesc", textarea=True)
+    photos = _i18n_inputs(html, "_botProfileUrl")
+    off = _checked(html, "callback_off")
+    cb = re.search(r'_callbackUrl[^>]*value="([^"]*)"', html)
+
+    info = admin("/botapi/internal/admin/getBotInfo",
+                 {"botNo": int(bot_no), "language": "zh-TW"}, debug=args.debug)
+    if not isinstance(info, dict) or "managerList" not in info:
+        raise SystemExit(f"could not read managers for bot {bot_no}; refusing "
+                         f"to write a payload that would clear them")
+
+    return {
+        "botNo": str(bot_no),
+        "name": {k: v for k, v in names.items()
+                 if k in _i18n_langs_on(html, "name")},
+        "description": {k: v for k, v in descs.items()
+                        if k in _i18n_langs_on(html, "desc")},
+        "photoUrl": {k: v for k, v in photos.items()
+                     if k in _i18n_langs_on(html, "profile")},
+        "joinTypeList": ["group"] if _checked(html, "check_chat1") else [],
+        "usePersistantMenu": False,
+        "callbackUrl": "" if off else (cb.group(1) if cb else ""),
+        "callbackEventList": [] if off else [
+            v for i, v in (("chk_msg_txt", "text"), ("chk_msg_place", "location"),
+                           ("chk_msg_sticker", "sticker"), ("chk_msg_photo", "image"),
+                           ("chk_msg_file", "file"), ("chk_msg_audio", "audio"),
+                           ("chk_msg_video", "video")) if _checked(html, i)],
+        "channelEventList": [] if off else [
+            e for e in CHANNEL_EVENTS if _checked(html, f"chk_{e}")],
+        "managerList": info["managerList"],
+        "submanagerList": info.get("submanagerList") or [],
+        "interfaceType": 1,
+        "allowDomainIdList": [0],
+    }
+
+
+def cmd_bot_set(args):
+    before = read_bot(args.bot, args)
+    after = json.loads(json.dumps(before))  # deep copy
+    if args.name:
+        after["name"]["default"] = args.name
+    if args.description:
+        after["description"]["default"] = args.description
+    if args.photo:
+        after["photoUrl"]["default"] = resolve_photo(args.photo, args,
+                                                     dry=args.dry_run)
+    if args.callback_url is not None:
+        after["callbackUrl"] = args.callback_url
+        if not args.callback_url:
+            after["callbackEventList"], after["channelEventList"] = [], []
+    if args.events is not None:
+        after["channelEventList"] = csv_opt(args.events, CHANNEL_EVENTS, "event")
+    if args.message_types is not None:
+        after["callbackEventList"] = csv_opt(args.message_types, MESSAGE_TYPES,
+                                             "message type")
+    if args.group is not None:
+        after["joinTypeList"] = ["group"] if args.group else []
+    if args.manager:
+        after["managerList"] = [int(u) for u in args.manager.split(",") if u.strip()]
+
+    changed = {k: (before[k], after[k]) for k in after if before[k] != after[k]}
+    if not changed:
+        return emit(ok({"botNo": args.bot, "changed": {}}), args.json,
+                    human="nothing to change")
+    diff = "\n".join(
+        f"  {k}:\n    - {json.dumps(o, ensure_ascii=False)}\n"
+        f"    + {json.dumps(n, ensure_ascii=False)}" for k, (o, n) in changed.items())
+    if args.dry_run:
+        return emit(ok({"changed": changed, "payload": after, "dry_run": True}),
+                    args.json, human=f"[dry-run] bot {args.bot}\n{diff}")
+    if not args.yes:
+        return emit(err("refusing to modify without --yes", EX_USAGE), args.json)
+    res = request("/console/bot/modify", body=after, debug=args.debug)
+    if (res or {}).get("code") != "00":
+        return emit(err(f"modify failed (code {(res or {}).get('code')})",
+                        detail=res), args.json)
+    return emit(ok({"botNo": args.bot, "changed": list(changed)}), args.json,
+                human=f"updated bot {args.bot}\n{diff}")
+
+
+def cmd_bot_secret_reissue(args):
+    """Invalidates the current secret immediately - anything running with the
+    old one starts failing webhook verification."""
+    if args.dry_run:
+        return emit(ok({"endpoint": f"/console/bot/modify-secret/{args.bot}",
+                        "dry_run": True}), args.json,
+                    human=f"[dry-run] would GET /console/bot/modify-secret/{args.bot}")
+    if not args.yes:
+        return emit(err("refusing to re-issue without --yes", EX_USAGE), args.json)
+    request(f"/console/bot/modify-secret/{args.bot}", debug=args.debug,
+            headers={"Referer": f"{BASE}/console/bot/info/{args.bot}"})
+    html = get(f"/console/bot/info/{args.bot}", expect_json=False,
+               debug=args.debug).get("_raw", "")
+    m = _SECRET_RE.search(html)
+    secret = m.group(1).strip() if m else None
+    return emit(ok({"botNo": args.bot, "botSecret": secret}), args.json,
+                human=f"re-issued; new secret: {secret}\n"
+                      f"update every config that holds the old one")
+
+
+def cmd_bot_delete(args):
+    """Deletes the bot itself, unlike `admin bot remove` which only un-enrols
+    it from the tenant. Note this is a GET that mutates - the console really
+    does it that way; there is no body and no manageDomainId."""
+    path = f"/console/bot/remove/{args.bot}"
+    if args.dry_run:
+        return emit(ok({"endpoint": path, "method": "GET", "dry_run": True}),
+                    args.json, human=f"[dry-run] would GET {path}")
+    if not args.yes:
+        return emit(err("refusing to delete without --yes", EX_USAGE), args.json)
+    res = request(path, debug=args.debug,
+                  headers={"Referer": f"{BASE}/console/bot/view"})
+    still = any(str(b["botNo"]) == str(args.bot) for b in parse_bots(
+        get("/console/bot/list", expect_json=False, debug=args.debug).get("_raw", "")))
+    return emit(ok({"botNo": args.bot, "deleted": not still, "response": res}),
+                args.json,
+                human=f"deleted bot {args.bot}" if not still else
+                      f"remove returned {res} but {args.bot} is still listed")
+
+
+def cmd_admin_remove(args):
+    body = {"botNo": int(args.bot)}
+    if args.dry_run:
+        return emit(ok({"body": body, "dry_run": True}), args.json,
+                    human=f"[dry-run] would POST removeBot {body}")
+    if not args.yes:
+        return emit(err("refusing to remove without --yes", EX_USAGE), args.json)
+    admin("/botapi/internal/admin/removeBot", body, debug=args.debug)
+    still = any(str(b.get("botNo")) == str(args.bot) for b in admin_bots(True, args))
+    return emit(ok({"botNo": args.bot, "removed": not still}), args.json,
+                human=f"removed bot {args.bot} from the tenant" if not still else
+                      f"removeBot ran but {args.bot} is still listed")
+
+
+def cmd_raw(args):
+    return emit(ok(get(args.path, expect_json=not args.html, debug=args.debug)), True)
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="JSON envelope")
+    common.add_argument("--debug", action="store_true", help="requests to stderr")
+    common.add_argument("--domain", default=DOMAIN, help=f"manageDomainId (default {DOMAIN})")
+    common.add_argument("--count", type=int, default=100)
+    common.add_argument("--cursor", type=int, default=1)
+
+    # every mutation is opt-in twice: --dry-run shows the exact payload, and
+    # nothing is sent without --yes. These act on a live corporate tenant.
+    write = argparse.ArgumentParser(add_help=False)
+    write.add_argument("--yes", action="store_true", help="actually do it")
+    write.add_argument("--dry-run", action="store_true",
+                       help="print the request that would be sent, send nothing")
+
+    p = argparse.ArgumentParser(prog="worksdev", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    d = sub.add_parser("doctor", parents=[common], help="verify the session")
+    d.set_defaults(fn=cmd_doctor)
+
+    a = sub.add_parser("app", parents=[common], help="registered OAuth apps")
+    asub = a.add_subparsers(dest="sub", required=True)
+
+    al = asub.add_parser("list", parents=[common], help="list apps")
+    al.add_argument("--reveal", action="store_true", help="show client secrets")
+    al.set_defaults(fn=cmd_app_list)
+
+    ash = asub.add_parser("show", parents=[common], help="one app, all fields")
+    ash.add_argument("app", help="clientId, appId, or (unique) app name")
+    ash.add_argument("--reveal", action="store_true", help="show client secret + public key")
+    ash.set_defaults(fn=cmd_app_show)
+
+    ac = asub.add_parser("create", parents=[common, write], help="register an OAuth app")
+    ac.add_argument("name", help="app name (must be unique in the tenant)")
+    ac.add_argument("--type", choices=sorted(APP_TYPES), default="normal",
+                    help="normal (default) · scim · delegated (super admin only)")
+    ac.add_argument("--reveal", action="store_true", help="show the new client secret")
+    ac.set_defaults(fn=cmd_app_create)
+
+    b = sub.add_parser("bot", parents=[common], help="bots")
+    bsub = b.add_subparsers(dest="sub", required=True)
+
+    bl = bsub.add_parser("list", parents=[common], help="list bots")
+    bl.set_defaults(fn=cmd_bot_list)
+
+    bc = bsub.add_parser("create", parents=[common, write], help="register a bot")
+    bc.add_argument("name")
+    bc.add_argument("--description", required=True, help="required by the console")
+    bc.add_argument("--manager", type=int, help="user number (default: you)")
+    bc.add_argument("--callback-url", help="https endpoint; without it the bot is send-only")
+    bc.add_argument("--events", help=f"comma-separated: {','.join(CHANNEL_EVENTS)}")
+    bc.add_argument("--message-types", help=f"comma-separated: {','.join(MESSAGE_TYPES)}")
+    bc.add_argument("--group", action="store_true", help="allow the bot into group talks")
+    bc.add_argument("--photo",
+                    help="avatar: an https URL or a local image file to upload "
+                         "(default: the console placeholder)")
+    bc.set_defaults(fn=cmd_bot_create)
+
+    bs = bsub.add_parser("show", parents=[common], help="one bot, incl. its secret")
+    bs.add_argument("bot", help="botNo (see `bot list`)")
+    bs.add_argument("--reveal", action="store_true", help="show the bot secret")
+    bs.set_defaults(fn=cmd_bot_show)
+
+    bset = bsub.add_parser("set", parents=[common, write],
+                           help="change bot settings (read-modify-write)")
+    bset.add_argument("bot", help="botNo")
+    bset.add_argument("--name")
+    bset.add_argument("--description")
+    bset.add_argument("--photo", help="https URL or local image file")
+    bset.add_argument("--callback-url", help="'' to turn callbacks off")
+    bset.add_argument("--events", help=f"replace with: {','.join(CHANNEL_EVENTS)}")
+    bset.add_argument("--message-types", help=f"replace with: {','.join(MESSAGE_TYPES)}")
+    bset.add_argument("--manager", help="replace managers: comma-separated userNos")
+    bset.add_argument("--group", dest="group", action="store_true", default=None,
+                      help="allow into group talks")
+    bset.add_argument("--no-group", dest="group", action="store_false",
+                      help="disallow group talks")
+    bset.set_defaults(fn=cmd_bot_set)
+
+    bsr = bsub.add_parser("secret-reissue", parents=[common, write],
+                          help="mint a new bot secret (invalidates the old one)")
+    bsr.add_argument("bot", help="botNo")
+    bsr.set_defaults(fn=cmd_bot_secret_reissue)
+
+    bd = bsub.add_parser("delete", parents=[common, write],
+                         help="delete the bot itself (not just un-enrol)")
+    bd.add_argument("bot", help="botNo")
+    bd.set_defaults(fn=cmd_bot_delete)
+
+    ag = asub.add_parser("grant", parents=[common, write], help="set OAuth scopes")
+    ag.add_argument("app")
+    ag.add_argument("--scopes", required=True, help="comma-separated, e.g. bot,bot.read")
+    ag.set_defaults(fn=cmd_app_grant)
+
+    asa = asub.add_parser("service-account", parents=[common, write],
+                          help="create (or --remove) the app's service account")
+    asa.add_argument("app")
+    asa.add_argument("--remove", action="store_true")
+    asa.set_defaults(fn=cmd_app_service_account)
+
+    ak = asub.add_parser("rsakey", parents=[common, write],
+                         help="mint + download the private key (ROTATES)")
+    ak.add_argument("app")
+    ak.add_argument("--out", help="output .pem (default <appName>.pem, mode 600)")
+    ak.add_argument("--rotate", action="store_true",
+                    help="required when the app already has a key")
+    ak.set_defaults(fn=cmd_app_rsakey)
+
+    aset = asub.add_parser("set", parents=[common, write],
+                           help="change app settings (read-modify-write)")
+    aset.add_argument("app")
+    aset.add_argument("--name", help="rename the app")
+    aset.add_argument("--description")
+    aset.add_argument("--scopes", help="replace the granted scopes")
+    aset.add_argument("--redirect-urls", help="comma-separated OAuth redirect URLs")
+    aset.add_argument("--ttl", type=int, choices=[3600, 86400],
+                      help="access token lifetime in seconds")
+    aset.add_argument("--rotation", choices=["Y", "N"],
+                      help="refresh token rotation")
+    aset.set_defaults(fn=cmd_app_set)
+
+    adel = asub.add_parser("delete", parents=[common, write], help="delete an app")
+    adel.add_argument("app")
+    adel.set_defaults(fn=cmd_app_delete)
+
+    ad = sub.add_parser("admin", parents=[common], help="admin.worksmobile.com")
+    adsub = ad.add_subparsers(dest="sub", required=True)
+    adb = adsub.add_parser("bot", parents=[common], help="tenant bot registry")
+    adbsub = adb.add_subparsers(dest="sub2", required=True)
+
+    adbsub.add_parser("pending", parents=[common],
+                      help="bots not yet enabled").set_defaults(fn=cmd_admin_pending)
+    adbsub.add_parser("list", parents=[common],
+                      help="enabled bots").set_defaults(fn=cmd_admin_list)
+
+    ae = adbsub.add_parser("enable", parents=[common, write],
+                           help="registerBot + switch it on")
+    ae.add_argument("bot", help="botNo")
+    ae.add_argument("--allow", help="userNos allowed to use it (default 0 = everyone)")
+    ae.add_argument("--register-only", action="store_true",
+                    help="add to the tenant but leave it switched off (status 1)")
+    ae.set_defaults(fn=cmd_admin_enable)
+
+    arm = adbsub.add_parser("remove", parents=[common, write],
+                            help="removeBot - take it out of the tenant")
+    arm.add_argument("bot")
+    arm.set_defaults(fn=cmd_admin_remove)
+
+    ast = adbsub.add_parser("status", parents=[common, write], help="updateBotStatus")
+    ast.add_argument("bot")
+    ast.add_argument("--status", type=int, default=2, help="2 = in service")
+    ast.add_argument("--allow", help="comma-separated userNos ('' = everyone)")
+    ast.set_defaults(fn=cmd_admin_status)
+
+    ob = sub.add_parser("onboard", parents=[common, write],
+                        help="app -> scopes -> service account -> key -> bot -> enable")
+    ob.add_argument("name")
+    ob.add_argument("--description", required=True)
+    ob.add_argument("--bot-name", help="bot display name (default: the app name)")
+    ob.add_argument("--account", help="openclaw account key (default: lowercased name)")
+    ob.add_argument("--scopes", help="default bot,bot.read")
+    ob.add_argument("--manager", type=int, help="bot owner userNo (default: you)")
+    ob.add_argument("--callback-url")
+    ob.add_argument("--key-out", help="where to write the .pem")
+    ob.add_argument("--photo", help="avatar: an https URL or a local image file")
+    ob.add_argument("--group", action="store_true")
+    ob.add_argument("--allow", help="userNos allowed to use the bot (default 0 = everyone)")
+    ob.add_argument("--register-only", action="store_true", help=argparse.SUPPRESS)
+    ob.set_defaults(fn=cmd_onboard)
+
+    r = sub.add_parser("raw", parents=[common], help="GET any /console/... path")
+    r.add_argument("path")
+    r.add_argument("--html", action="store_true", help="path serves HTML, not JSON")
+    r.set_defaults(fn=cmd_raw)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return args.fn(args)
+    except Auth as e:
+        return emit(err(str(e), EX_AUTH), args.json)
+    except ApiError as e:
+        return emit(err(str(e), detail=e.body[:500]), args.json)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
