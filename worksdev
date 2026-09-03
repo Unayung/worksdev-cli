@@ -30,14 +30,7 @@ import urllib.request
 
 BASE = "https://dev.worksmobile.com"
 REGION = os.environ.get("WORKSDEV_REGION", "jp")  # only shapes the Referer
-# ponytail: one tenant per machine is the normal case; --domain / env override
-# is there for the second one. Discoverable from any app's domainId if it moves.
-DOMAIN = os.environ.get("WORKSDEV_DOMAIN", "400714392")
-
 ADMIN_BASE = "https://admin.worksmobile.com"
-# the admin console addresses the SAME tenant by a different id than the dev
-# console does (E231494 vs 400714392) - neither is derivable from the other.
-ADMIN_TENANT = os.environ.get("WORKSDEV_ADMIN_TENANT", "E231494")
 
 CONFIG_DIR = os.path.expanduser("~/.config/worksdev")
 COOKIE_FILE = os.path.join(CONFIG_DIR, "cookie")
@@ -120,6 +113,83 @@ def check_cookie_perms():
         return (f"{COOKIE_FILE} is mode {mode:o}; others can read your "
                 f"session. fix with: chmod 600 {COOKIE_FILE}")
     return None
+
+
+# ------------------------------------------------------------------ tenant
+# Both ids belong to whoever the cookie belongs to, so nothing about a tenant
+# is baked into this file. The dev console's id is detected from the console
+# page and cached; the admin console's is not reachable without already
+# knowing it (its gateway 403s an unprefixed path), so it is asked for once.
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+
+
+def load_config():
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def detect_domain(debug=False):
+    """The console renders its own manageDomainId into every page as a hidden
+    input, which is where its JavaScript reads it from too."""
+    page = request(f"/{REGION}/console/openapi/v2/app/list/view",
+                   expect_json=False, debug=debug)
+    m = re.search(r'id="manageDomainId"[^>]*value="([^"]+)"', page.get("_raw", ""))
+    if not m:
+        raise SystemExit("could not detect manageDomainId from the console page; "
+                         "set WORKSDEV_DOMAIN or run `worksdev config --domain <id>`")
+    return m.group(1)
+
+
+def resolve_domain(args):
+    for v in (getattr(args, "domain", None), os.environ.get("WORKSDEV_DOMAIN"),
+              load_config().get("domain")):
+        if v:
+            return v
+    got = detect_domain(getattr(args, "debug", False))
+    cfg = load_config()
+    cfg["domain"] = got
+    save_config(cfg)
+    print(f"detected manageDomainId {got} (cached in {CONFIG_FILE})",
+          file=sys.stderr)
+    return got
+
+
+def resolve_admin_tenant(args):
+    for v in (getattr(args, "admin_tenant", None),
+              os.environ.get("WORKSDEV_ADMIN_TENANT"),
+              load_config().get("adminTenant")):
+        if v:
+            return v
+    raise SystemExit(
+        "admin tenant id is not set. It cannot be detected: the admin gateway "
+        "refuses any path that does not already carry it.\n"
+        "Find it once in your browser - open admin.worksmobile.com, DevTools "
+        "> Network, and read the id in any /api/<THIS>/... request - then:\n"
+        "  worksdev config --admin-tenant <id>")
+
+
+def cmd_config(args):
+    cfg = load_config()
+    if args.domain:
+        cfg["domain"] = args.domain
+    if args.admin_tenant:
+        cfg["adminTenant"] = args.admin_tenant
+    if args.detect:
+        cfg["domain"] = detect_domain(args.debug)
+    if args.domain or args.admin_tenant or args.detect:
+        save_config(cfg)
+    return emit(ok(dict(cfg, path=CONFIG_FILE)), args.json,
+                human="\n".join([f"  {k}: {v}" for k, v in cfg.items()] +
+                                [f"  ({CONFIG_FILE})"]) or "(nothing configured)")
 
 
 def looks_logged_out(final_url, ctype, expect_json=True):
@@ -574,10 +644,14 @@ def cmd_bot_show(args):
 
 
 # ------------------------------------------------------------ admin plane
-def admin(path, body=None, method="POST", debug=False):
+def admin(path, body=None, method="POST", debug=False, args=None):
     """admin.worksmobile.com is a separate host with its own tenant id in the
     path, and it wants the version header on every bot call."""
-    return request(f"/api/{ADMIN_TENANT}{path}", body=body, method=method,
+    tenant = resolve_admin_tenant(args) if args is not None else \
+        (os.environ.get("WORKSDEV_ADMIN_TENANT") or load_config().get("adminTenant"))
+    if not tenant:
+        resolve_admin_tenant(args)
+    return request(f"/api/{tenant}{path}", body=body, method=method,
                    debug=debug, base=ADMIN_BASE,
                    headers={"X-WORKS-ADMIN-VERSION": "2",
                             "Origin": ADMIN_BASE,
@@ -587,7 +661,7 @@ def admin(path, body=None, method="POST", debug=False):
 def admin_bots(registered, args, page=1):
     res = admin("/botapi/internal/admin/getBotList",
                 {"register": registered, "language": "zh-TW",
-                 "pageIndex": page, "pagePerLength": 100}, debug=args.debug)
+                 "pageIndex": page, "pagePerLength": 100}, debug=args.debug, args=args)
     return (res or {}).get("botList") or []
 
 
@@ -651,7 +725,7 @@ def cmd_admin_status(args):
                     human=f"[dry-run] would POST updateBotStatus {body}")
     if not args.yes:
         return emit(err("refusing to change status without --yes", EX_USAGE), args.json)
-    admin("/botapi/internal/admin/updateBotStatus", body, debug=args.debug)
+    admin("/botapi/internal/admin/updateBotStatus", body, debug=args.debug, args=args)
     return emit(ok(body), args.json, human=f"bot {args.bot} status={args.status}")
 
 
@@ -1027,7 +1101,7 @@ def cmd_admin_remove(args):
                     human=f"[dry-run] would POST removeBot {body}")
     if not args.yes:
         return emit(err("refusing to remove without --yes", EX_USAGE), args.json)
-    admin("/botapi/internal/admin/removeBot", body, debug=args.debug)
+    admin("/botapi/internal/admin/removeBot", body, debug=args.debug, args=args)
     still = any(str(b.get("botNo")) == str(args.bot) for b in admin_bots(True, args))
     return emit(ok({"botNo": args.bot, "removed": not still}), args.json,
                 human=f"removed bot {args.bot} from the tenant" if not still else
@@ -1042,7 +1116,8 @@ def build_parser():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", help="JSON envelope")
     common.add_argument("--debug", action="store_true", help="requests to stderr")
-    common.add_argument("--domain", default=DOMAIN, help=f"manageDomainId (default {DOMAIN})")
+    common.add_argument("--domain", help="manageDomainId (default: detected + cached)")
+    common.add_argument("--admin-tenant", help="admin console tenant id")
     common.add_argument("--count", type=int, default=100)
     common.add_argument("--cursor", type=int, default=1)
 
@@ -1059,6 +1134,12 @@ def build_parser():
 
     d = sub.add_parser("doctor", parents=[common], help="verify the session")
     d.set_defaults(fn=cmd_doctor)
+
+    cf = sub.add_parser("config", parents=[common],
+                        help="show or set the tenant ids for this login")
+    cf.add_argument("--detect", action="store_true",
+                    help="re-detect manageDomainId from the console")
+    cf.set_defaults(fn=cmd_config)
 
     a = sub.add_parser("app", parents=[common], help="registered OAuth apps")
     asub = a.add_subparsers(dest="sub", required=True)
@@ -1220,6 +1301,10 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
+        # every command but `config` needs the dev-console tenant; resolving it
+        # here keeps detection out of each command and off the config path
+        if args.cmd != "config":
+            args.domain = resolve_domain(args)
         return args.fn(args)
     except Auth as e:
         return emit(err(str(e), EX_AUTH), args.json)

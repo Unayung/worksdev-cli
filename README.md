@@ -38,7 +38,7 @@ umask 077
 pbpaste > ~/.config/worksdev/cookie      # or paste with your editor
 chmod 600 ~/.config/worksdev/cookie
 
-worksdev doctor        # session ok · domain 400714392 · 7 apps
+worksdev doctor        # session ok · domain 4xxxxxxxx · 7 apps
 ```
 
 `WORKSDEV_COOKIE` overrides the file. If `~/.config/worksdev/cookie` is absent
@@ -49,6 +49,31 @@ The cookie is never printed. Exit `3` means the session expired — log in again
 and refresh the file. A dead session does **not** 401; it redirects to the SSO
 login page and returns `200 text/html`, which the CLI detects and reports as an
 auth failure rather than "no apps".
+
+## Tenant ids
+
+Both consoles address your tenant by an id, and the two are **different and
+unrelated** — the developer console uses a numeric `manageDomainId`, the admin
+console an `E`-prefixed one embedded in its API path. Both belong to whoever
+the cookie belongs to, so nothing is baked into the source.
+
+```bash
+worksdev config                       # show what is set
+worksdev config --admin-tenant E123456
+worksdev config --detect              # re-detect the dev console id
+```
+
+The **dev console id is detected automatically** on first use (the console
+renders it into every page as a hidden `manageDomainId` input) and cached in
+`~/.config/worksdev/config.json`.
+
+The **admin id cannot be detected** — its gateway rejects any path that does
+not already carry it, so there is no unprefixed endpoint to ask. Read it once
+from any `/api/<THIS>/...` request in the admin console's DevTools Network tab
+and set it with `config --admin-tenant`. Only the `admin` commands need it.
+
+`WORKSDEV_DOMAIN` / `WORKSDEV_ADMIN_TENANT` override the config file, and
+`--domain` / `--admin-tenant` override both.
 
 ## Commands
 
@@ -264,8 +289,8 @@ also each app's `domainId`.
 ### Provisioning (learned by doing it)
 
 - **Two hosts, two tenant ids, one cookie.** The dev console is
-  `dev.worksmobile.com` with `?manageDomainId=400714392`; the admin console is
-  `admin.worksmobile.com` with `E231494` **in the path**. Neither id is
+  `dev.worksmobile.com` with a numeric `?manageDomainId=`; the admin console
+  is `admin.worksmobile.com` with an `E`-prefixed id **in the path**. Neither is
   derivable from the other. The same session cookie authenticates both.
   Admin bot calls also need `X-WORKS-ADMIN-VERSION: 2`.
 - **`POST /console/bot/register` fails with a bare `{"code":"21"}` if you omit
