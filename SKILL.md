@@ -9,6 +9,8 @@ Zero-dependency Python CLI driving the **LINE WORKS Developer Console**
 (`dev.worksmobile.com`) and **Admin Console** (`admin.worksmobile.com`).
 
 **Binary:** `worksdev` if on PATH, else `~/Projects/worksdev-cli/worksdev`.
+Companion `worksdev-login` turns an id + password into a session (needs
+playwright); the main CLI stays zero-dependency and only replays a cookie.
 
 **Always pass `--json`** when parsing. Envelope:
 `{"ok":true,"data":...}` / `{"ok":false,"error":{"message":...,"code":N}}`.
@@ -32,15 +34,24 @@ step 3 refuse to start.
 worksdev doctor        # "session ok · domain … · N apps"
 ```
 
-Exit `3` or "no session cookie" means the user must log in at
-`dev.worksmobile.com` as a **tenant admin**, copy the whole `Cookie` request
-header from any `/console/...` XHR in DevTools, and save it to
-`~/.config/worksdev/cookie` (mode 600). You cannot do this for them — the
-cookies are `HttpOnly`. `doctor` also auto-detects and caches the developer
-console tenant id.
+Exit `3` or "no session cookie" means there is no valid session (must be a
+**tenant admin**). Two ways to create one:
 
-**2. Admin tenant id.** Required by the final onboarding step and *not*
-detectable:
+- **id + password** — `worksdev-login --save` (needs playwright; prompts for
+  the password or reads `WORKSDEV_ID`/`WORKSDEV_PASSWORD`). This is the path
+  for a self-service/web flow, and it also captures **both** tenant ids so it
+  covers step 2. As a library: `wl.login(id, pw)` → `{cookie, domain,
+  adminTenant}`; hand `cookie` to worksdev via `WORKSDEV_COOKIE`. Never pass
+  the password as a CLI argument (shell history, `ps`).
+- **paste a cookie** — user logs in at `dev.worksmobile.com`, copies the whole
+  `Cookie` header from any `/console/...` XHR in DevTools, saves it to
+  `~/.config/worksdev/cookie` (mode 600). Cookies are `HttpOnly`; you cannot
+  read them for the user.
+
+`doctor` auto-detects and caches the developer console tenant id either way.
+
+**2. Admin tenant id.** Required by the final onboarding step; auto-captured by
+`worksdev-login` but *not* detectable from a pasted cookie:
 
 ```bash
 worksdev config        # does it list adminTenant?

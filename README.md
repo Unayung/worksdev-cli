@@ -50,6 +50,63 @@ and refresh the file. A dead session does **not** 401; it redirects to the SSO
 login page and returns `200 text/html`, which the CLI detects and reports as an
 auth failure rather than "no apps".
 
+## Logging in with a password
+
+The main `worksdev` is zero-dependency and only replays a session cookie.
+`worksdev-login` is the optional piece that *gets* one from an id + password,
+for a self-service flow where a person types credentials and never sees a
+cookie or DevTools.
+
+It drives the real NAVER WORKS login in a headless browser, so the browser
+does the RSA encryption and device fingerprint — this never reimplements them,
+and so does not break when NAVER changes them. On success it returns the
+session cookie plus **both** tenant ids (the admin one is scraped from the
+admin console's own API calls).
+
+```bash
+pip install playwright && playwright install chromium   # once, ~150MB
+
+# save the session for the CLI:
+WORKSDEV_ID=you@yourdomain worksdev-login --save        # prompts for password
+
+# or capture it for a backend, nothing written to disk:
+worksdev-login --id you@yourdomain --json
+#   {"cookie":"NEO_SES=…; WORKS_SES=…","domain":"…","adminTenant":"…"}
+```
+
+The password comes from `WORKSDEV_PASSWORD` or an interactive prompt — never a
+CLI argument (it would land in shell history and `ps`). It is held only in
+memory and dropped after the attempt; `--save` writes just the cookie and
+tenant ids. One attempt per call — a wrong password is reported, not retried,
+so a script cannot lock the account.
+
+**As a library** (this is the shape the web flow uses):
+
+```python
+import importlib.util, pathlib
+from importlib.machinery import SourceFileLoader
+p = pathlib.Path("worksdev-login")
+spec = importlib.util.spec_from_file_location(
+    "wl", p, loader=SourceFileLoader("wl", str(p)))
+wl = importlib.util.module_from_spec(spec); spec.loader.exec_module(wl)
+
+session = wl.login(user_id, password)   # {cookie, domain, adminTenant}
+# then run worksdev with all three in the environment, nothing on disk:
+#   env WORKSDEV_COOKIE=session["cookie"] \
+#       WORKSDEV_DOMAIN=session["domain"] \
+#       WORKSDEV_ADMIN_TENANT=session["adminTenant"] \
+#       worksdev onboard "…" --bot-name "…" --account … --description "…" --yes
+```
+
+`login()` raises `LoginError` on a bad credential or an unexpected challenge
+(this tenant has no 2-step verification; one that did would surface here). It
+does not require 2FA to be off — it just cannot answer an OTP unattended, so
+run `--headed` for a one-off manual challenge.
+
+> This automates a login to *your own* tenant with the user's own credentials.
+> It is the same thing the browser does; check your org's policy on automation
+> before wiring it into a service.
+
 ## Tenant ids
 
 Both consoles address your tenant by an id, and the two are **different and
@@ -109,28 +166,45 @@ ln -s "$PWD/worksdev" ~/.local/bin/worksdev     # optional
 ### 2. Hand it a session
 
 You need to be a **tenant admin** — the consoles will not show you apps or
-bots otherwise. Log in at `dev.worksmobile.com`, open DevTools → Network,
-click any `/console/...` request and copy its entire `Cookie` request header
-(the session cookies are `HttpOnly`, so `document.cookie` will not show them):
+bots otherwise. Two ways to get a session:
+
+**a. Log in with id + password** (via `worksdev-login`, needs playwright — see
+[Logging in with a password](#logging-in-with-a-password)). This also detects
+**both** tenant ids, so it covers step 3 too:
+
+```bash
+pip install playwright && playwright install chromium   # once
+WORKSDEV_ID=you@yourdomain worksdev-login --save        # prompts for password
+#   session saved to ~/.config/worksdev/cookie
+#     domain: 4xxxxxxxx  adminTenant: Exxxxxx
+```
+
+**b. Paste a cookie** (zero dependencies). Log in at `dev.worksmobile.com`,
+open DevTools → Network, click any `/console/...` request and copy its whole
+`Cookie` request header (session cookies are `HttpOnly`, so `document.cookie`
+will not show them):
 
 ```bash
 mkdir -p ~/.config/worksdev && umask 077
-pbpaste > ~/.config/worksdev/cookie          # or paste with an editor
+pbpaste > ~/.config/worksdev/cookie
 chmod 600 ~/.config/worksdev/cookie
+```
 
+Either way, confirm it:
+
+```bash
 worksdev doctor
-#   detected manageDomainId 4xxxxxxxx (cached in ~/.config/worksdev/config.json)
 #   session ok · domain 4xxxxxxxx · 7 apps
 ```
 
-`doctor` both proves the session works and detects the developer console's
-tenant id. If it exits `3`, the cookie is wrong or already expired.
+`doctor` detects the developer console's tenant id on first use. Exit `3`
+means the session is wrong or expired.
 
 ### 3. Give it the admin tenant id — **do this before onboarding**
 
-The final step of onboarding happens on the *admin* console, which uses a
-different tenant id that cannot be auto-detected. Open
-`admin.worksmobile.com`, DevTools → Network, and read the id out of any
+`worksdev-login` already captured this. If you pasted a cookie instead, the
+admin console's tenant id is a *different* id that cannot be auto-detected —
+open `admin.worksmobile.com`, DevTools → Network, and read it from any
 `/api/<THIS>/...` request:
 
 ```bash

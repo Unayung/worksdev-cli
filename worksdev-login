@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""worksdev-login - turn a LINE WORKS id + password into a session for worksdev.
+
+The main `worksdev` CLI is zero-dependency and only ever replays a session
+cookie. This is the optional piece that obtains one: it drives the real NAVER
+WORKS login in a headless browser, so the browser does the RSA/fingerprint
+work and this script never reimplements (or breaks against) it.
+
+The point is a self-service web flow: a backend takes the user's id/password,
+calls `login()`, gets back a cookie plus both tenant ids, runs an onboarding,
+and throws the password away. Nothing is written to disk unless you ask.
+
+  Requires playwright:  pip install playwright && playwright install chromium
+  The password is read from WORKSDEV_PASSWORD or prompted (never a CLI arg,
+  which would leak into shell history and the process table). It is held only
+  in memory. --save writes just the cookie + tenant ids, never the password.
+
+  Unofficial. Automates a login to your own tenant. A wrong password repeated
+  can lock a corporate account - this does ONE attempt per call and reports
+  failure rather than retrying.
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import re
+import sys
+
+CONFIG_DIR = os.path.expanduser("~/.config/worksdev")
+COOKIE_FILE = os.path.join(CONFIG_DIR, "cookie")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+CONSOLE = "https://dev.worksmobile.com/console/openapi/v2/app/list/view"
+ADMIN = "https://admin.worksmobile.com/service/bot"
+
+EX_OK, EX_ERR, EX_USAGE, EX_AUTH = 0, 1, 2, 3
+
+
+class LoginError(Exception):
+    pass
+
+
+def _tenant_from_url(url):
+    """The admin SPA carries its tenant id in the API path, /api/<id>/... -
+    that is the only place it is observable, so we scrape it off requests."""
+    m = re.search(r"/api/([A-Z0-9]{6,})/", url)
+    return m.group(1) if m else None
+
+
+def _build_jar(cookies):
+    """Cookie objects -> the 'k=v; k=v' header string worksdev replays. Only
+    worksmobile cookies; a session needs NEO_SES or WORKS_SES to be usable."""
+    jar = "; ".join(f"{c['name']}={c['value']}" for c in cookies
+                    if "worksmobile" in c["domain"])
+    if "NEO_SES" not in jar and "WORKS_SES" not in jar:
+        raise LoginError("logged in but no session cookie came back")
+    return jar
+
+
+def login(user_id, password, *, headless=True, want_admin=True, timeout=30000):
+    """Log in and return {cookie, domain, adminTenant}. Raises LoginError on a
+    bad credential or an unexpected challenge (e.g. 2-step, which this tenant
+    does not use but another might). The password is never stored or logged."""
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        raise LoginError("playwright is not installed: "
+                         "pip install playwright && playwright install chromium")
+
+    admin_tenant = {"id": None}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        ctx = browser.new_context()
+        pg = ctx.new_page()
+        # catch the admin tenant id off any /api/<id>/ request the SPA makes
+        ctx.on("request", lambda r: admin_tenant.__setitem__(
+            "id", admin_tenant["id"] or _tenant_from_url(r.url)))
+        try:
+            pg.goto(CONSOLE, wait_until="domcontentloaded", timeout=timeout)
+            # ID-first flow: id, submit, then the password field renders
+            pg.fill("#user_id", user_id)
+            pg.click("#loginStart")
+            try:
+                pg.wait_for_selector("input[type=password]:visible", timeout=15000)
+            except PWTimeout:
+                raise LoginError("the password step never appeared - the id may "
+                                 "be rejected, or the login flow changed")
+            pg.fill("input[type=password]:visible", password)
+            for sel in ("button.btn_submit:visible", "#loginStart",
+                        "[type=submit]:visible"):
+                if pg.query_selector(sel):
+                    pg.click(sel)
+                    break
+            try:
+                pg.wait_for_url("**dev.worksmobile.com/**console**", timeout=timeout)
+            except PWTimeout:
+                raise LoginError(f"login did not complete (still at {pg.url}); "
+                                 f"wrong password, or a challenge like 2-step "
+                                 f"verification is in the way")
+            # manageDomainId is rendered into the console page
+            html = pg.content()
+            m = re.search(r'id="manageDomainId"[^>]*value="([^"]+)"', html)
+            domain = m.group(1) if m else None
+            if want_admin and not admin_tenant["id"]:
+                try:
+                    pg.goto(ADMIN, wait_until="networkidle", timeout=timeout)
+                except PWTimeout:
+                    pass
+            cookies = ctx.cookies()
+        finally:
+            browser.close()
+
+    return {"cookie": _build_jar(cookies), "domain": domain,
+            "adminTenant": admin_tenant["id"]}
+
+
+def save(result):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    fd = os.open(COOKIE_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(result["cookie"] + "\n")
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        cfg = {}
+    if result.get("domain"):
+        cfg["domain"] = result["domain"]
+    if result.get("adminTenant"):
+        cfg["adminTenant"] = result["adminTenant"]
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+    return cfg
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="worksdev-login", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--id", help="login id (or WORKSDEV_ID); prompted if absent")
+    ap.add_argument("--save", action="store_true",
+                    help=f"write the cookie to {COOKIE_FILE} + tenant ids to config")
+    ap.add_argument("--json", action="store_true",
+                    help="print {cookie, domain, adminTenant} as JSON (for a backend)")
+    ap.add_argument("--headed", action="store_true",
+                    help="show the browser (for debugging or a manual challenge)")
+    ap.add_argument("--no-admin", action="store_true",
+                    help="skip visiting the admin console to detect its tenant id")
+    args = ap.parse_args(argv)
+
+    user_id = args.id or os.environ.get("WORKSDEV_ID") or input("login id: ").strip()
+    password = os.environ.get("WORKSDEV_PASSWORD") or getpass.getpass("password: ")
+    if not user_id or not password:
+        print("id and password are required", file=sys.stderr)
+        return EX_USAGE
+    try:
+        result = login(user_id, password, headless=not args.headed,
+                       want_admin=not args.no_admin)
+    except LoginError as e:
+        print(f"login failed: {e}", file=sys.stderr)
+        return EX_AUTH
+    finally:
+        password = None  # drop it
+
+    if args.save:
+        cfg = save(result)
+        print(f"session saved to {COOKIE_FILE}")
+        print(f"  domain: {cfg.get('domain')}  adminTenant: {cfg.get('adminTenant')}")
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+    if not args.save and not args.json:
+        print(f"logged in · domain {result['domain']} · "
+              f"adminTenant {result['adminTenant']}")
+        print("re-run with --save to store the session, or --json to capture it")
+    return EX_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
