@@ -1,32 +1,40 @@
 # worksdev
 
-Drive the **LINE WORKS Developer Console** (`dev.worksmobile.com`) from the
-shell — read the registered OAuth apps and bots (client IDs, secrets, service
-accounts, token settings), and register new ones.
+Drive the **LINE WORKS Developer and Admin consoles** from the shell — read,
+create, edit and delete OAuth apps and bots, grant scopes, mint
+service-account keys, and **onboard a bot end to end** (app → scopes → key →
+bot → enable), with the credentials an integration needs printed at the end.
 
-Zero dependencies. Python 3.8+. Single file.
+The main CLI is **zero-dependency** (Python 3.8+, single file) and drives the
+consoles by replaying a session cookie. The optional `worksdev-login` turns an
+id + password into that session and needs playwright.
 
 > **Unofficial.** Not affiliated with LINE WORKS / NAVER WORKS / Works Mobile.
-> This drives the console's own private endpoints with your browser session
-> cookie. They are undocumented and can change without notice. `create`
-> registers real apps and bots in a real tenant — every write needs `--yes`.
+> This drives the consoles' own private endpoints with your browser session.
+> They are undocumented and can change without notice. Writes register, edit
+> and delete real apps and bots in a real tenant — every write needs `--yes`.
 > Use on your own account only and check your org's IT policy.
 
 ## Why this exists
 
-The console is the *only* place app registrations live. The official LINE WORKS
-API cannot list your apps, read a `clientSecret`, or register a new one — those
-are console-only. So a CLI has to go through the console's own session.
+LINE WORKS has **no public API for provisioning**. Registering an OAuth app,
+reading a `clientSecret`, minting a service-account key, creating a bot and
+enabling it for the tenant happen only inside the two web consoles — the
+developer console (`dev.worksmobile.com`) and the admin console
+(`admin.worksmobile.com`). This drives both through their own sessions, so the
+whole path from nothing to a bot people can add runs from the shell.
 
 Sibling to [`lineworks`](../lineworks-cli) (messaging, `talk.worksmobile.com`).
-Same auth model, different host.
+Same auth model, different hosts.
 
-## Auth
+## Getting a session
 
-The console login is NAVER SSO — RSA-encrypted password, a Fingerprint2 device
-fingerprint and possibly 2-step verification. Scripting that is fragile and
-risks locking a corporate account, so **this replays a browser session instead**
-(the same call the console page makes).
+Two ways, and the CLI only ever replays the result:
+
+- **`worksdev-login`** — log in with an id + password (needs playwright); best
+  for a self-service flow, and it captures **both** tenant ids. See
+  [Logging in with a password](#logging-in-with-a-password).
+- **Paste a cookie** — zero dependencies, shown here.
 
 Log in at `dev.worksmobile.com`, open DevTools → Network, click any
 `/console/...` XHR and copy its whole `Cookie` request header (the session
@@ -134,20 +142,43 @@ and set it with `config --admin-tenant`. Only the `admin` commands need it.
 
 ## Commands
 
+Full surface; each group has its own section below. Reads need no flag; every
+write needs `--yes`, and `--dry-run` previews it first. `--json` on anything
+gives the machine-readable envelope.
+
 ```bash
-worksdev doctor                    # verify the session, count apps
+worksdev doctor                         # verify the session, count apps
+worksdev config [--admin-tenant <id>] [--detect]   # show/set tenant ids
 
-worksdev app list                  # name · type · clientId · last modified
-worksdev app list --reveal         # include client secrets
+# apps
+worksdev app list [--reveal]            # --reveal shows client secrets
+worksdev app show <app> [--reveal]      # match by clientId, appId or unique name
+worksdev app create <name> [--type normal|scim|delegated] --yes
+worksdev app grant <app> --scopes bot,bot.read --yes
+worksdev app service-account <app> [--remove] --yes
+worksdev app rsakey <app> --out k.pem [--rotate] --yes    # mints a NEW key
+worksdev app set <app> [--name|--description|--scopes|--redirect-urls|--ttl|--rotation] --yes
+worksdev app delete <app> --yes
 
-worksdev app show nike             # match by clientId, appId, or unique name
-worksdev app show Uhrpj9zNnQppcyCqKZ0X
-worksdev app show "Racco Bot" --reveal    # + clientSecret and publicKey
+# bots (developer console)
+worksdev bot list
+worksdev bot show <botNo> [--reveal]    # --reveal shows the bot secret
+worksdev bot create <name> --description D [--photo|--group|--callback-url|--events|--message-types] --yes
+worksdev bot set <botNo> [--name|--description|--photo|--callback-url|--events|--message-types|--group|--no-group|--manager] --yes
+worksdev bot secret-reissue <botNo> --yes
+worksdev bot delete <botNo> --yes
 
-worksdev bot list                  # name · botNo
+# bots (admin console — needs the admin tenant id)
+worksdev admin bot pending|list
+worksdev admin bot enable <botNo> [--register-only] [--allow <userNos>] --yes
+worksdev admin bot status <botNo> --status 1|2 [--allow <userNos>] --yes
+worksdev admin bot remove <botNo> --yes
 
-worksdev raw /console/gnb/get      # GET any console path
-worksdev raw /console/bot/list --html      # for paths that serve HTML
+# the whole chain, plus the session helper
+worksdev onboard <app> --description D [--bot-name|--account|--photo|...] --yes
+worksdev-login [--save|--json]          # id + password -> session (needs playwright)
+
+worksdev raw <path> [--html]            # GET any console path (escape hatch)
 ```
 
 ## Zero to a bot people can add

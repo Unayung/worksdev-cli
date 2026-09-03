@@ -20,19 +20,19 @@ assert not w.looks_logged_out(
     "https://dev.worksmobile.com/console/openapi/v2/app/list?x=1",
     "application/json")
 
-app = {"appName": "Racco Bot", "clientId": "abc123", "appId": "Z9",
+app = {"appName": "Demo Bot", "clientId": "abc123", "appId": "Z9",
        "clientSecret": "s3cr3t"}
 assert w.mask(app, reveal=False)["clientSecret"] == "••••••"
 assert w.mask(app, reveal=True)["clientSecret"] == "s3cr3t"
 assert app["clientSecret"] == "s3cr3t", "mask must not mutate the original"
 assert w.mask({"clientSecret": ""}, reveal=False)["clientSecret"] == ""
 
-apps = [app, {"appName": "Racco-Nike App", "clientId": "d4", "appId": "Y8"}]
+apps = [app, {"appName": "Demo-Nike App", "clientId": "d4", "appId": "Y8"}]
 assert w.pick(apps, "abc123") is app          # clientId
 assert w.pick(apps, "Z9") is app              # appId
-assert w.pick(apps, "racco bot") is app       # exact name, case-insensitive
+assert w.pick(apps, "demo bot") is app        # exact name, case-insensitive
 assert w.pick(apps, "nike") is apps[1]        # unique substring
-for bad in ("racco", "nope"):                 # ambiguous and missing both refuse
+for bad in ("demo", "nope"):                  # ambiguous and missing both refuse
     try:
         w.pick(apps, bad)
         raise AssertionError(f"{bad!r} should not resolve")
@@ -62,11 +62,12 @@ except SystemExit:
     pass
 
 # a bot secret contains '+'; an alphabet-guessing regex truncated it silently
+SECRET = "aB3d+Ef9/GhiJkl012MnoPq+rStuvw"   # base64-ish: '+' and '/' both matter
 info = ('<th colspan="2">Bot Secret</th>\n<td>\n'
-        '<span class="msg" id="botSecret"> mxbCHF+uk31rIK59j80DWS6cWK1Swx </span>')
-assert w._SECRET_RE.search(info).group(1).strip() == "mxbCHF+uk31rIK59j80DWS6cWK1Swx"
+        f'<span class="msg" id="botSecret"> {SECRET} </span>')
+assert w._SECRET_RE.search(info).group(1).strip() == SECRET
 
 assert w.cells("提米 App") == 8, "2+2 for the CJK pair, not 1+1"
-assert w.cells("Racco Bot") == len("Racco Bot")
+assert w.cells("Demo Bot") == len("Demo Bot")
 
 print("ok")
