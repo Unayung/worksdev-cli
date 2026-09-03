@@ -93,6 +93,112 @@ worksdev raw /console/gnb/get      # GET any console path
 worksdev raw /console/bot/list --html      # for paths that serve HTML
 ```
 
+## Zero to a bot people can add
+
+The whole path, assuming nothing is set up yet. Steps 1–3 are once per
+machine; step 4 is once per bot.
+
+### 1. Install
+
+```bash
+git clone https://github.com/Unayung/worksdev-cli.git
+cd worksdev-cli && chmod +x worksdev
+ln -s "$PWD/worksdev" ~/.local/bin/worksdev     # optional
+```
+
+### 2. Hand it a session
+
+You need to be a **tenant admin** — the consoles will not show you apps or
+bots otherwise. Log in at `dev.worksmobile.com`, open DevTools → Network,
+click any `/console/...` request and copy its entire `Cookie` request header
+(the session cookies are `HttpOnly`, so `document.cookie` will not show them):
+
+```bash
+mkdir -p ~/.config/worksdev && umask 077
+pbpaste > ~/.config/worksdev/cookie          # or paste with an editor
+chmod 600 ~/.config/worksdev/cookie
+
+worksdev doctor
+#   detected manageDomainId 4xxxxxxxx (cached in ~/.config/worksdev/config.json)
+#   session ok · domain 4xxxxxxxx · 7 apps
+```
+
+`doctor` both proves the session works and detects the developer console's
+tenant id. If it exits `3`, the cookie is wrong or already expired.
+
+### 3. Give it the admin tenant id — **do this before onboarding**
+
+The final step of onboarding happens on the *admin* console, which uses a
+different tenant id that cannot be auto-detected. Open
+`admin.worksmobile.com`, DevTools → Network, and read the id out of any
+`/api/<THIS>/...` request:
+
+```bash
+worksdev config --admin-tenant E123456
+worksdev config                    # confirm both ids are set
+```
+
+Skip this and `onboard` refuses to start — deliberately, so a missing
+one-line config cannot leave a half-built app and bot behind.
+
+Optional, but nice: drop a square avatar at
+`~/.config/worksdev/default-avatar.png` and every bot gets it automatically.
+
+### 4. Onboard the bot
+
+Always dry-run first — it prints the plan and touches nothing:
+
+```bash
+worksdev onboard "Racco-Helper App" \
+    --bot-name "小幫手" \
+    --account helper \
+    --description "internal helper bot" \
+    --callback-url https://your-gateway/lineworks/helper/webhook \
+    --group \
+    --key-out ~/.openclaw/keys/helper.pem \
+    --dry-run
+```
+
+Then re-run with `--yes`:
+
+```
+  app created: YVAfWDF0CpfaYt8W7aHuTA
+  scopes granted: bot, bot.read
+  service account: xxxxx.serviceaccount@example.com
+  private key: ~/.openclaw/keys/helper.pem (1704 bytes)
+  bot created: 13076092
+  bot secret read
+  enabled in admin (status=2)
+```
+
+**`status=2` is the finish line** — the bot is registered in the tenant and
+switched on, so people can now find and add it in their LINE WORKS client.
+`status=1` would mean enrolled but off.
+
+### 5. Check it
+
+```bash
+worksdev admin bot list          # the bot should be here with status=2
+worksdev admin bot pending       # and NOT here
+```
+
+If it shows up under `pending`, it was created but never enrolled — finish
+with `worksdev admin bot enable <botNo> --yes`.
+
+By default everyone in the tenant may add it. To restrict:
+`worksdev admin bot status <botNo> --status 2 --allow <userNo>,<userNo> --yes`.
+
+### 6. Wire it into whatever runs it
+
+`onboard` prints the two config blocks. For openclaw, paste them into
+`~/.openclaw/openclaw.json` under `channels.lineworks` and
+`channels.lineworks.accounts.<account>`, then restart the gateway.
+
+Adding the bot works as soon as step 4 succeeds; **replying** additionally
+needs the callback URL to be publicly reachable and the agent running behind
+it. If the bot can be added but never answers, check the webhook before you
+suspect the credentials.
+
 ### Onboarding a bot end to end
 
 One command does app → scopes → service account → RSA key → bot → enable, and

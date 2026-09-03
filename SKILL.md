@@ -21,34 +21,67 @@ LINE WORKS has **no public API for provisioning**. OAuth apps, client secrets,
 service accounts, RSA keys and bots exist only inside the web consoles. This
 replays a browser session against the consoles' own private endpoints.
 
-## Setup (once per machine)
+## Onboarding a bot from zero
+
+Do these **in order**. Steps 1–2 are once per machine; skipping step 2 makes
+step 3 refuse to start.
+
+**1. Session.** Check first — do not assume it is set up:
 
 ```bash
-worksdev doctor                        # verifies the session; auto-detects the dev tenant
-worksdev config --admin-tenant E123456 # only needed for `admin` commands
+worksdev doctor        # "session ok · domain … · N apps"
 ```
 
-Cookie: `~/.config/worksdev/cookie` (mode 600), or `WORKSDEV_COOKIE`. It falls
-back to `~/.config/lineworks/cookie`. Tenant ids live in
-`~/.config/worksdev/config.json`; the dev one self-detects, the admin one must
-be read from the admin console's DevTools once.
+Exit `3` or "no session cookie" means the user must log in at
+`dev.worksmobile.com` as a **tenant admin**, copy the whole `Cookie` request
+header from any `/console/...` XHR in DevTools, and save it to
+`~/.config/worksdev/cookie` (mode 600). You cannot do this for them — the
+cookies are `HttpOnly`. `doctor` also auto-detects and caches the developer
+console tenant id.
 
-## The whole job in one command
+**2. Admin tenant id.** Required by the final onboarding step and *not*
+detectable:
+
+```bash
+worksdev config        # does it list adminTenant?
+```
+
+If missing, ask the user to open `admin.worksmobile.com` → DevTools → Network
+and read the id from any `/api/<THIS>/...` request, then
+`worksdev config --admin-tenant <id>`. `onboard` checks this up front and
+aborts before creating anything, so a missing id cannot strand a half-built
+app and bot.
+
+**3. Onboard.** Dry-run, show the user the plan, then commit:
 
 ```bash
 worksdev onboard "<App Name>" --description "<what it does>" \
-    --bot-name "<Bot Name>" --account <openclaw-key> \
-    --photo ./avatar.png --group \
+    --bot-name "<Bot Name>" --account <key> \
     --callback-url https://host/lineworks/<key>/webhook \
-    --key-out ~/.openclaw/keys/<key>.pem --yes
+    --group --photo ./avatar.png \
+    --key-out ~/.openclaw/keys/<key>.pem --dry-run   # then --yes
 ```
 
 Runs: create app → grant `bot,bot.read` → create service account → mint RSA
-key → create bot → enable in admin. Prints the openclaw
-`channels.lineworks` + `accounts.<key>` blocks. **`--dry-run` first.**
+key → create bot → enable in admin. Prints the openclaw `channels.lineworks`
+and `accounts.<key>` blocks.
 
-On failure it stops and lists what already exists — finish with the discrete
-commands below rather than re-running (the app name will now be taken).
+**4. Verify.** The last line must read `enabled in admin (status=2)`.
+Confirm with `worksdev admin bot list` — the bot is there with `status=2` and
+absent from `worksdev admin bot pending`. **`status=2` is what makes the bot
+addable by people**; `status=1` means enrolled but switched off, fixed with
+`worksdev admin bot enable <botNo> --yes`.
+
+**5. Wire it up.** Paste the printed blocks into the consuming config (for
+openclaw, `~/.openclaw/openclaw.json`) and restart its gateway.
+
+Being *addable* needs only step 3. **Replying** also needs the callback URL to
+be publicly reachable with the agent running behind it — if a bot can be added
+but never answers, suspect the webhook, not the credentials.
+
+If `onboard` fails midway it prints what already exists; finish with the
+discrete commands below rather than re-running, since the app name is now
+taken.
 
 ## Commands
 

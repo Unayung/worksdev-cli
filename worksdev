@@ -754,6 +754,9 @@ def cmd_onboard(args):
                                                            for i, s in enumerate(plan)))
     if not args.yes:
         return emit(err("refusing to provision without --yes", EX_USAGE), args.json)
+    # the admin tenant is only needed by the LAST step; check it before the
+    # first, or a missing one-line config leaves a half-built app + bot behind
+    resolve_admin_tenant(args)
     try:
         if not app_name_free(args.name, args):
             return emit(err(f"app name {args.name!r} is already taken"), args.json)
