@@ -8,7 +8,7 @@ description: Provision and manage LINE WORKS bots and OAuth apps from the CLI - 
 Zero-dependency Python CLI driving the **LINE WORKS Developer Console**
 (`dev.worksmobile.com`) and **Admin Console** (`admin.worksmobile.com`).
 
-**Binary:** `worksdev` if on PATH, else `~/Projects/worksdev-cli/worksdev`.
+**Binary:** `worksdev` if on PATH, else the `worksdev` script next to this file.
 Companion `worksdev-login` turns an id + password into a session (needs
 playwright); the main CLI stays zero-dependency and only replays a cookie.
 
@@ -41,7 +41,9 @@ Exit `3` or "no session cookie" means there is no valid session (must be a
   the password or reads `WORKSDEV_ID`/`WORKSDEV_PASSWORD`). This is the path
   for a self-service/web flow, and it also captures **both** tenant ids so it
   covers step 2. As a library: `wl.login(id, pw)` → `{cookie, domain,
-  adminTenant}`; hand `cookie` to worksdev via `WORKSDEV_COOKIE`. Never pass
+  adminTenant}` (load it with `SourceFileLoader`, see README; the hyphenated
+  filename can't be imported directly); hand `cookie` to worksdev via
+  `WORKSDEV_COOKIE`. Never pass
   the password as a CLI argument (shell history, `ps`).
 - **paste a cookie** — user logs in at `dev.worksmobile.com`, copies the whole
   `Cookie` header from any `/console/...` XHR in DevTools, saves it to
