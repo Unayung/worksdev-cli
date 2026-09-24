@@ -31,7 +31,10 @@ import sys
 CONFIG_DIR = os.path.expanduser("~/.config/worksdev")
 COOKIE_FILE = os.path.join(CONFIG_DIR, "cookie")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
-CONSOLE = "https://dev.worksmobile.com/console/openapi/v2/app/list/view"
+# Start at auth with an https accessUrl: opening the console directly makes it
+# build an http://...:80 accessUrl, and that post-login hop hangs on 443-only hosts (#1)
+CONSOLE = ("https://auth.worksmobile.com/login/login"
+           "?accessUrl=https%3A%2F%2Fdev.worksmobile.com%2Fconsole%2Fopenapi%2Fv2%2Fapp%2Flist%2Fview")
 ADMIN = "https://admin.worksmobile.com/service/bot"
 
 EX_OK, EX_ERR, EX_USAGE, EX_AUTH = 0, 1, 2, 3
